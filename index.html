@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="fi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#12151a">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
+<title>Junat</title>
+<style>
+  :root { --bg:#12151a; --card:#1b1f27; --fg:#fff; --dim:#98a0ad; --blue:#8ab4f8; --green:#7ce38b; --red:#ff8a80; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.35 system-ui, sans-serif; }
+  body { padding: env(safe-area-inset-top) 12px calc(env(safe-area-inset-bottom) + 12px); min-height:100vh; }
+  header { display:flex; align-items:center; gap:8px; padding:12px 0; position:sticky; top:0; background:var(--bg); }
+  header h1 { flex:1; margin:0; font-size:20px; }
+  #updated { color:var(--dim); font-size:13px; }
+  header button { background:none; border:0; color:var(--fg); font-size:24px; padding:6px 10px; }
+  section { background:var(--card); border-radius:16px; padding:12px 14px; margin-bottom:12px; }
+  section h2 { margin:0 0 6px; font-size:15px; color:var(--blue); }
+  .row { display:flex; gap:10px; align-items:baseline; padding:5px 0; }
+  .line { width:34px; font-weight:700; }
+  .head { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .plat { color:var(--dim); font-size:13px; }
+  .time { font-variant-numeric: tabular-nums; white-space:nowrap; }
+  .time.rt { color:var(--green); }
+  .rel { color:var(--dim); font-size:13px; margin-left:6px; }
+  .msg { color:var(--dim); padding:5px 0; }
+  .err { background:#3a2020; color:var(--red); border-radius:12px; padding:10px 14px; margin-bottom:12px; }
+  dialog { background:var(--card); color:var(--fg); border:0; border-radius:16px; width:min(92vw, 460px); padding:18px; }
+  dialog::backdrop { background:rgba(0,0,0,.6); }
+  label { display:block; margin:12px 0 4px; font-size:14px; color:var(--dim); }
+  input, textarea { width:100%; background:var(--bg); color:var(--fg); border:1px solid #333a46; border-radius:10px; padding:10px; font:inherit; }
+  textarea { min-height:110px; font-family:ui-monospace, monospace; font-size:14px; }
+  .btns { display:flex; gap:10px; justify-content:flex-end; margin-top:16px; }
+  .btns button { border:0; border-radius:10px; padding:10px 16px; font:inherit; background:#333a46; color:var(--fg); }
+  .btns button.primary { background:var(--blue); color:#111; font-weight:600; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Junat</h1>
+  <span id="updated"></span>
+  <button id="refresh" aria-label="Päivitä">↻</button>
+  <button id="settingsBtn" aria-label="Asetukset">⚙</button>
+</header>
+<main id="list"></main>
+
+<dialog id="settings">
+  <h2 style="margin:0">Asetukset</h2>
+  <label for="key">Digitransit API-avain</label>
+  <input id="key" type="password" autocomplete="off" autocapitalize="off" spellcheck="false">
+  <label for="stations">Asemat (yksi per rivi: Nimi;HSL:ID)</label>
+  <textarea id="stations" autocapitalize="off" spellcheck="false" placeholder="Pohjois-Haaga;HSL:1234567&#10;Pasila;HSL:1234567&#10;Helsinki;HSL:1234567"></textarea>
+  <label for="count">Lähtöjä per asema</label>
+  <input id="count" type="number" min="1" max="10" inputmode="numeric">
+  <div class="btns">
+    <button id="cancel">Peruuta</button>
+    <button id="save" class="primary">Tallenna</button>
+  </div>
+  <p style="color:var(--dim);font-size:12px;margin:12px 0 0">Tiedot tallentuvat vain tämän puhelimen selaimeen.</p>
+</dialog>
+
+<script>
+const ENDPOINT = 'https://api.digitransit.fi/routing/v2/hsl/gtfs/v1';
+const $ = id => document.getElementById(id);
+const DEFAULTS = { key: '', count: 4, stations: '' };
+
+function loadCfg() {
+  try { return { ...DEFAULTS, ...JSON.parse(localStorage.getItem('junat') || '{}') }; }
+  catch (e) { return { ...DEFAULTS }; }
+}
+function saveCfg(c) {
+  try { localStorage.setItem('junat', JSON.stringify(c)); } catch (e) {}
+}
+function parseStations(text) {
+  return text.split('\n').map(l => l.trim()).filter(Boolean).map(l => {
+    const i = l.lastIndexOf(';');
+    if (i < 0) return { label: l, id: l };
+    const id = l.slice(i + 1).trim();
+    return { label: l.slice(0, i).trim() || id, id };
+  }).filter(s => s.id);
+}
+
+let cfg = loadCfg();
+let state = { boards: null, error: null, updated: null };
+let busy = false;
+
+const clock = new Intl.DateTimeFormat('en-GB', { hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'Europe/Helsinki' });
+
+async function fetchBoards(stations) {
+  // Yksi kysely kaikille asemille. Kokeillaan sekä station- että stop-hakua,
+  // jotta toimii oli ID sitten aseman tai yksittäisen pysäkin.
+  let q = 'query {';
+  stations.forEach((s, i) => {
+    const id = JSON.stringify(s.id);
+    q += ` st${i}: station(id: ${id}) { ...F } sp${i}: stop(id: ${id}) { ...F }`;
+  });
+  q += ` } fragment F on Stop { stoptimesWithoutPatterns(numberOfDepartures: ${cfg.count}, omitNonPickups: true) { serviceDay realtimeDeparture realtime headsign trip { route { shortName } } stop { platformCode } } }`;
+
+  const res = await fetch(ENDPOINT, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'digitransit-subscription-key': cfg.key },
+    body: JSON.stringify({ query: q })
+  });
+  if (!res.ok) throw new Error('HTTP ' + res.status + (res.status === 401 || res.status === 403 ? ' (tarkista API-avain)' : ''));
+  const json = await res.json();
+  if (json.errors && json.errors.length) throw new Error(json.errors[0].message);
+
+  return stations.map((s, i) => {
+    const node = json.data['st' + i] || json.data['sp' + i];
+    if (!node) return { label: s.label, deps: [], note: 'ID:tä ei löytynyt' };
+    return {
+      label: s.label,
+      deps: (node.stoptimesWithoutPatterns || []).map(t => ({
+        line: (t.trip && t.trip.route && t.trip.route.shortName) || '',
+        head: t.headsign || '',
+        at: t.serviceDay + t.realtimeDeparture,
+        rt: !!t.realtime,
+        plat: (t.stop && t.stop.platformCode) || ''
+      }))
+    };
+  });
+}
+
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text != null) e.textContent = text;
+  return e;
+}
+
+function render() {
+  const list = $('list');
+  list.textContent = '';
+  if (state.error) list.append(el('div', 'err', state.error));
+  $('updated').textContent = state.updated ? clock.format(state.updated) : '';
+  if (!state.boards) return;
+  const now = Math.floor(Date.now() / 1000);
+
+  for (const b of state.boards) {
+    const sec = el('section');
+    sec.append(el('h2', null, b.label));
+    const upcoming = b.deps.filter(d => d.at >= now - 60);
+    if (!upcoming.length) sec.append(el('div', 'msg', b.note || 'Ei lähtöjä'));
+    for (const d of upcoming) {
+      const mins = Math.floor((d.at - now) / 60);
+      const row = el('div', 'row');
+      row.append(el('span', 'line', d.line));
+      const head = el('span', 'head', d.head);
+      if (d.plat) head.append(el('span', 'plat', '  · r. ' + d.plat));
+      row.append(head);
+      const time = el('span', 'time' + (d.rt ? ' rt' : ''), clock.format(new Date(d.at * 1000)));
+      time.append(el('span', 'rel', mins <= 0 ? 'nyt' : mins + ' min'));
+      row.append(time);
+      sec.append(row);
+    }
+    list.append(sec);
+  }
+}
+
+async function refresh() {
+  const stations = parseStations(cfg.stations);
+  if (!cfg.key || !stations.length) { openSettings(); return; }
+  if (busy) return;
+  busy = true;
+  try {
+    state.boards = await fetchBoards(stations);
+    state.error = null;
+    state.updated = new Date();
+  } catch (e) {
+    state.error = e instanceof TypeError ? 'Ei yhteyttä' : 'Virhe: ' + e.message;
+  }
+  busy = false;
+  render();
+}
+
+function openSettings() {
+  $('key').value = cfg.key;
+  $('stations').value = cfg.stations;
+  $('count').value = cfg.count;
+  const d = $('settings');
+  if (!d.open) d.showModal();
+}
+
+$('settingsBtn').onclick = openSettings;
+$('cancel').onclick = () => $('settings').close();
+$('save').onclick = () => {
+  cfg = {
+    key: $('key').value.trim(),
+    stations: $('stations').value,
+    count: Math.min(10, Math.max(1, parseInt($('count').value, 10) || 4))
+  };
+  saveCfg(cfg);
+  $('settings').close();
+  state = { boards: null, error: null, updated: null };
+  render();
+  refresh();
+};
+$('refresh').onclick = refresh;
+
+setInterval(() => { if (document.visibilityState === 'visible') refresh(); }, 30000);
+setInterval(render, 10000);
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') refresh(); });
+
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
+render();
+refresh();
+</script>
+</body>
+</html>
