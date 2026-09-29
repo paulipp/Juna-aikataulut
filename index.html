@@ -51,8 +51,8 @@
   <h2 style="margin:0">Asetukset</h2>
   <label for="key">Digitransit API-avain</label>
   <input id="key" type="password" autocomplete="off" autocapitalize="off" spellcheck="false">
-  <label for="stations">Asemat (yksi per rivi: Nimi;HSL:ID)</label>
-  <textarea id="stations" autocapitalize="off" spellcheck="false" placeholder="Pohjois-Haaga;HSL:1234567&#10;Pasila;HSL:1234567&#10;Helsinki;HSL:1234567"></textarea>
+  <label for="stations">Asemat (yksi per rivi: Nimi;HSL:ID;suodatin — suodatin valinnainen)</label>
+  <textarea id="stations" autocapitalize="off" spellcheck="false" placeholder="Pohjois-Haaga;HSL:1234567&#10;Pasila;HSL:1234567&#10;Pasila raide 2;HSL:1174501;Lentoasema"></textarea>
   <label for="count">Lähtöjä per asema</label>
   <input id="count" type="number" min="1" max="10" inputmode="numeric">
   <div class="btns">
@@ -76,11 +76,18 @@ function saveCfg(c) {
 }
 function parseStations(text) {
   return text.split('\n').map(l => l.trim()).filter(Boolean).map(l => {
-    const i = l.lastIndexOf(';');
-    if (i < 0) return { label: l, id: l };
-    const id = l.slice(i + 1).trim();
-    return { label: l.slice(0, i).trim() || id, id };
+    const parts = l.split(';').map(p => p.trim());
+    const [label, id, filter] = parts.length >= 2 ? parts : [parts[0], parts[0]];
+    return { label: label || id, id, filter: filter || '' };
   }).filter(s => s.id);
+}
+
+// Suodattaa lähdöt headsignin perusteella, jos asemalle on annettu suodatinteksti.
+// Vertailu on kirjainkoosta riippumaton ja osuu osamerkkijonoon (esim. "Lentoasema" täsmää
+// headsigniin "Tikkurila-Lentoasema via Malmi").
+function matchesFilter(headsign, filter) {
+  if (!filter) return true;
+  return headsign.toLocaleLowerCase('fi').includes(filter.toLocaleLowerCase('fi'));
 }
 
 let cfg = loadCfg();
@@ -92,12 +99,15 @@ const clock = new Intl.DateTimeFormat('en-GB', { hour: '2-digit', minute: '2-dig
 async function fetchBoards(stations) {
   // Yksi kysely kaikille asemille. Kokeillaan sekä station- että stop-hakua,
   // jotta toimii oli ID sitten aseman tai yksittäisen pysäkin.
+  // Haetaan enemmän lähtöjä kuin näytetään, jotta suodatettuna (esim. vain tiettyyn
+  // suuntaan menevät) jää silti cfg.count kappaletta jäljelle.
+  const fetchCount = Math.min(20, Math.max(cfg.count * 4, 15));
   let q = 'query {';
   stations.forEach((s, i) => {
     const id = JSON.stringify(s.id);
     q += ` st${i}: station(id: ${id}) { ...F } sp${i}: stop(id: ${id}) { ...F }`;
   });
-  q += ` } fragment F on Stop { stoptimesWithoutPatterns(numberOfDepartures: ${cfg.count}, omitNonPickups: true) { serviceDay realtimeDeparture realtime headsign trip { route { shortName } } stop { platformCode } } }`;
+  q += ` } fragment F on Stop { stoptimesWithoutPatterns(numberOfDepartures: ${fetchCount}, omitNonPickups: true) { serviceDay realtimeDeparture realtime headsign trip { route { shortName } } stop { platformCode } } }`;
 
   const res = await fetch(ENDPOINT, {
     method: 'POST',
@@ -111,15 +121,20 @@ async function fetchBoards(stations) {
   return stations.map((s, i) => {
     const node = json.data['st' + i] || json.data['sp' + i];
     if (!node) return { label: s.label, deps: [], note: 'ID:tä ei löytynyt' };
-    return {
-      label: s.label,
-      deps: (node.stoptimesWithoutPatterns || []).map(t => ({
+    const deps = (node.stoptimesWithoutPatterns || [])
+      .map(t => ({
         line: (t.trip && t.trip.route && t.trip.route.shortName) || '',
         head: t.headsign || '',
         at: t.serviceDay + t.realtimeDeparture,
         rt: !!t.realtime,
         plat: (t.stop && t.stop.platformCode) || ''
       }))
+      .filter(d => matchesFilter(d.head, s.filter))
+      .slice(0, cfg.count);
+    return {
+      label: s.label,
+      deps,
+      note: s.filter && !deps.length ? `Ei osumia suodattimelle "${s.filter}"` : undefined
     };
   });
 }
