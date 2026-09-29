@@ -51,10 +51,13 @@
   <h2 style="margin:0">Asetukset</h2>
   <label for="key">Digitransit API-avain</label>
   <input id="key" type="password" autocomplete="off" autocapitalize="off" spellcheck="false">
-  <label for="stations">Asemat (yksi per rivi: Nimi;HSL:ID;suodatin — suodatin valinnainen)</label>
-  <textarea id="stations" autocapitalize="off" spellcheck="false" placeholder="Pohjois-Haaga;HSL:1234567&#10;Pasila;HSL:1234567&#10;Pasila raide 2;HSL:1174501;Lentoasema"></textarea>
+  <label for="stations">Asemat (yksi per rivi: Nimi;ID tai H-koodi;suodatin — suodatin valinnainen)</label>
+  <textarea id="stations" autocapitalize="off" spellcheck="false" placeholder="Pohjois-Haaga;HSL:1234567&#10;Pasila raide 2;H0085;Lentoasema&#10;Helsinki, P Lentoasemalle;H0064;Myyrmäki"></textarea>
+  <p style="color:var(--dim);font-size:12px;margin:4px 0 0">ID (HSL:xxxxxxx) toimii aina suoraan. Asiakkaalle näkyvä H-koodi (esim. H0064) muunnetaan taustalla koodilistan avulla.</p>
   <label for="count">Lähtöjä per asema</label>
   <input id="count" type="number" min="1" max="10" inputmode="numeric">
+  <p id="codeStatus" style="color:var(--dim);font-size:12px;margin:14px 0 0"></p>
+  <button id="refreshCodes" type="button" style="margin-top:8px;width:100%;border:0;border-radius:10px;padding:10px;font:inherit;background:#333a46;color:var(--fg)">Päivitä H-koodilista nyt</button>
   <div class="btns">
     <button id="cancel">Peruuta</button>
     <button id="save" class="primary">Tallenna</button>
@@ -90,6 +93,76 @@ function matchesFilter(headsign, filter) {
   return headsign.toLocaleLowerCase('fi').includes(filter.toLocaleLowerCase('fi'));
 }
 
+// ---------- H-koodi -> gtfsId ----------
+// Digitransitin rajapinta ei tue hakua asiakkaalle näkyvällä H-koodilla suoraan
+// (vain gtfsId tai nimen osamerkkijono), joten sovellus lataa koko HSL-alueen
+// koodilistan kerran ja tallentaa sen puhelimeen. H-koodit ratkaistaan sen jälkeen
+// paikallisesti ilman ylimääräistä verkkokutsua jokaisella päivityksellä.
+const CODE_CACHE_KEY = 'junat_codemap';
+const CODE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000; // 30 vrk
+
+function isGtfsId(v) { return v.includes(':'); }
+
+function loadCodeCache() {
+  try { return JSON.parse(localStorage.getItem(CODE_CACHE_KEY)); }
+  catch (e) { return null; }
+}
+function saveCodeCache(map) {
+  try { localStorage.setItem(CODE_CACHE_KEY, JSON.stringify({ updatedAt: Date.now(), map })); }
+  catch (e) {}
+}
+function codeStatusText() {
+  const c = loadCodeCache();
+  if (!c) return 'H-koodilistaa ei ole vielä ladattu — ladataan automaattisesti kun tarvitaan.';
+  const n = Object.keys(c.map).length;
+  const days = Math.floor((Date.now() - c.updatedAt) / 86400000);
+  return `H-koodilista: ${n} koodia, päivitetty ${days <= 0 ? 'tänään' : days + ' vrk sitten'}.`;
+}
+
+async function fetchAllCodes(key) {
+  const res = await fetch(ENDPOINT, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'digitransit-subscription-key': key },
+    body: JSON.stringify({ query: '{ stops { gtfsId code } }' })
+  });
+  if (!res.ok) throw new Error('HTTP ' + res.status + (res.status === 401 || res.status === 403 ? ' (tarkista API-avain)' : ''));
+  const json = await res.json();
+  if (json.errors && json.errors.length) throw new Error(json.errors[0].message);
+  const map = {};
+  for (const s of (json.data.stops || [])) {
+    if (s.code) map[s.code.toUpperCase()] = s.gtfsId;
+  }
+  return map;
+}
+
+let codeMapPromise = null; // estää rinnakkaiset päällekkäiset lataukset
+async function ensureCodeMap(key, force) {
+  const cached = loadCodeCache();
+  if (!force && cached && (Date.now() - cached.updatedAt) < CODE_MAX_AGE_MS) return cached.map;
+  if (!codeMapPromise) {
+    codeMapPromise = fetchAllCodes(key)
+      .then(map => { saveCodeCache(map); return map; })
+      .catch(e => { if (cached) return cached.map; throw e; })
+      .finally(() => { codeMapPromise = null; });
+  }
+  return codeMapPromise;
+}
+
+// Ratkaisee jokaiselle asemalle lopullisen gtfsId:n: jo valmis ID (sisältää ':') menee
+// suoraan läpi, H-koodi (esim. "H0064") haetaan koodilistasta.
+async function resolveStations(stations, key) {
+  if (stations.every(s => isGtfsId(s.id))) {
+    return stations.map(s => ({ ...s, resolvedId: s.id }));
+  }
+  let map = {};
+  try { map = await ensureCodeMap(key); }
+  catch (e) { map = {}; }
+  return stations.map(s => {
+    if (isGtfsId(s.id)) return { ...s, resolvedId: s.id };
+    return { ...s, resolvedId: map[s.id.toUpperCase()] || null };
+  });
+}
+
 let cfg = loadCfg();
 let state = { boards: null, error: null, updated: null };
 let busy = false;
@@ -97,29 +170,40 @@ let busy = false;
 const clock = new Intl.DateTimeFormat('en-GB', { hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'Europe/Helsinki' });
 
 async function fetchBoards(stations) {
-  // Yksi kysely kaikille asemille. Kokeillaan sekä station- että stop-hakua,
-  // jotta toimii oli ID sitten aseman tai yksittäisen pysäkin.
+  // H-koodit (esim. "H0064") muunnetaan ensin gtfsId:ksi paikallisen koodilistan avulla.
+  const resolved = await resolveStations(stations, cfg.key);
+
+  // Yksi kysely kaikille onnistuneesti ratkaistuille asemille. Kokeillaan sekä station-
+  // että stop-hakua, jotta toimii oli ID sitten aseman tai yksittäisen pysäkin.
   // Haetaan enemmän lähtöjä kuin näytetään, jotta suodatettuna (esim. vain tiettyyn
   // suuntaan menevät) jää silti cfg.count kappaletta jäljelle.
   const fetchCount = Math.min(20, Math.max(cfg.count * 4, 15));
-  let q = 'query {';
-  stations.forEach((s, i) => {
-    const id = JSON.stringify(s.id);
-    q += ` st${i}: station(id: ${id}) { ...F } sp${i}: stop(id: ${id}) { ...F }`;
+  const parts = [];
+  resolved.forEach((s, i) => {
+    if (!s.resolvedId) return;
+    const id = JSON.stringify(s.resolvedId);
+    parts.push(`st${i}: station(id: ${id}) { ...F } sp${i}: stop(id: ${id}) { ...F }`);
   });
-  q += ` } fragment F on Stop { stoptimesWithoutPatterns(numberOfDepartures: ${fetchCount}, omitNonPickups: true) { serviceDay realtimeDeparture realtime headsign trip { route { shortName } } stop { platformCode } } }`;
 
-  const res = await fetch(ENDPOINT, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'digitransit-subscription-key': cfg.key },
-    body: JSON.stringify({ query: q })
-  });
-  if (!res.ok) throw new Error('HTTP ' + res.status + (res.status === 401 || res.status === 403 ? ' (tarkista API-avain)' : ''));
-  const json = await res.json();
-  if (json.errors && json.errors.length) throw new Error(json.errors[0].message);
+  let data = {};
+  if (parts.length) {
+    const q = `query { ${parts.join(' ')} } fragment F on Stop { stoptimesWithoutPatterns(numberOfDepartures: ${fetchCount}, omitNonPickups: true) { serviceDay realtimeDeparture realtime headsign trip { route { shortName } } stop { platformCode } } }`;
+    const res = await fetch(ENDPOINT, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'digitransit-subscription-key': cfg.key },
+      body: JSON.stringify({ query: q })
+    });
+    if (!res.ok) throw new Error('HTTP ' + res.status + (res.status === 401 || res.status === 403 ? ' (tarkista API-avain)' : ''));
+    const json = await res.json();
+    if (json.errors && json.errors.length) throw new Error(json.errors[0].message);
+    data = json.data;
+  }
 
-  return stations.map((s, i) => {
-    const node = json.data['st' + i] || json.data['sp' + i];
+  return resolved.map((s, i) => {
+    if (!s.resolvedId) {
+      return { label: s.label, deps: [], note: `H-koodia "${s.id}" ei löytynyt — päivitä koodilista asetuksista` };
+    }
+    const node = data['st' + i] || data['sp' + i];
     if (!node) return { label: s.label, deps: [], note: 'ID:tä ei löytynyt' };
     const deps = (node.stoptimesWithoutPatterns || [])
       .map(t => ({
@@ -195,12 +279,26 @@ function openSettings() {
   $('key').value = cfg.key;
   $('stations').value = cfg.stations;
   $('count').value = cfg.count;
+  $('codeStatus').textContent = codeStatusText();
   const d = $('settings');
   if (!d.open) d.showModal();
 }
 
 $('settingsBtn').onclick = openSettings;
 $('cancel').onclick = () => $('settings').close();
+$('refreshCodes').onclick = async () => {
+  const key = $('key').value.trim() || cfg.key;
+  if (!key) { $('codeStatus').textContent = 'Syötä ensin API-avain.'; return; }
+  $('refreshCodes').disabled = true;
+  $('codeStatus').textContent = 'Ladataan koodilistaa…';
+  try {
+    await ensureCodeMap(key, true);
+    $('codeStatus').textContent = codeStatusText();
+  } catch (e) {
+    $('codeStatus').textContent = 'Virhe: ' + e.message;
+  }
+  $('refreshCodes').disabled = false;
+};
 $('save').onclick = () => {
   cfg = {
     key: $('key').value.trim(),
